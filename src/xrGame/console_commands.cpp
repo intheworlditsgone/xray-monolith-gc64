@@ -2433,6 +2433,7 @@ void CCC_RegisterCommands()
 	CMD3(CCC_Mask, "mt_level_sounds", &g_mt_config, mtLevelSounds);
 	CMD3(CCC_Mask, "mt_alife", &g_mt_config, mtALife);
 	CMD3(CCC_Mask, "mt_map", &g_mt_config, mtMap);
+	CMD4(CCC_Integer, "mt_parallel_dispatch", &mt_parallel_dispatch, 0, 1);
 #endif // MASTER_GOLD
 
 #ifndef MASTER_GOLD

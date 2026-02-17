@@ -832,8 +832,8 @@ void CAI_Stalker::net_Destroy()
 #ifdef DEBUG
 	fastdelegate::FastDelegate0<>	f = fastdelegate::FastDelegate0<>(this,&CAI_Stalker::update_object_handler);
 	xr_vector<fastdelegate::FastDelegate0<> >::const_iterator	I;
-	I	= std::find(Device.seqParallel.begin(),Device.seqParallel.end(),f);
-	VERIFY							(I == Device.seqParallel.end());
+	I	= std::find(Device.seqParallelLua.begin(),Device.seqParallelLua.end(),f);
+	VERIFY							(I == Device.seqParallelLua.end());
 #endif // DEBUG
 
 	xr_delete(m_ce_close);
@@ -1024,10 +1024,10 @@ void CAI_Stalker::UpdateCL()
 						this, &CAI_Stalker::update_object_handler);
 #ifdef DEBUG
 			xr_vector<fastdelegate::FastDelegate0<> >::const_iterator	I;
-			I	= std::find(Device.seqParallel.begin(),Device.seqParallel.end(),f);
-			VERIFY							(I == Device.seqParallel.end());
+			I	= std::find(Device.seqParallelLua.begin(),Device.seqParallelLua.end(),f);
+			VERIFY							(I == Device.seqParallelLua.end());
 #endif
-					Device.seqParallel.push_back(
+					Device.seqParallelLua.push_back(
 						fastdelegate::FastDelegate0<>(this, &CAI_Stalker::update_object_handler));
 				}
 				else

@@ -109,6 +109,17 @@ void CDialogHolder::StopMenu(CUIDialogWnd* pDialog)
 	else
 		SetMainInputReceiver(pDialog, true);
 
+	while (TopInputReceiver() == pDialog)
+		SetMainInputReceiver(NULL, false);
+
+	for (xr_vector<recvItem>::iterator it = m_input_receivers.begin(); it != m_input_receivers.end();)
+	{
+		if (it->m_item == pDialog)
+			it = m_input_receivers.erase(it);
+		else
+			++it;
+	}
+
 	RemoveDialogToRender(pDialog);
 	pDialog->SetHolder(nullptr);
 
@@ -210,10 +221,6 @@ void CDialogHolder::SetMainInputReceiver(CUIDialogWnd* ir, bool _find_remove)
 			for (; cnt > 0; --cnt)
 				if (m_input_receivers[cnt - 1].m_item == ir)
 				{
-					m_input_receivers[cnt].m_flags.set(recvItem::eCrosshair,
-					                                   m_input_receivers[cnt - 1].m_flags.test(recvItem::eCrosshair));
-					m_input_receivers[cnt].m_flags.set(recvItem::eIndicators,
-					                                   m_input_receivers[cnt - 1].m_flags.test(recvItem::eIndicators));
 					xr_vector<recvItem>::iterator it = m_input_receivers.begin();
 					std::advance(it, cnt - 1);
 					m_input_receivers.erase(it);
@@ -223,6 +230,14 @@ void CDialogHolder::SetMainInputReceiver(CUIDialogWnd* ir, bool _find_remove)
 	}
 	else
 	{
+		for (xr_vector<recvItem>::iterator it = m_input_receivers.begin(); it != m_input_receivers.end();)
+		{
+			if (it->m_item == ir)
+				it = m_input_receivers.erase(it);
+			else
+				++it;
+		}
+
 		m_input_receivers.push_back(recvItem(ir));
 	}
 };
@@ -246,6 +261,12 @@ void CDialogHolder::OnFrame()
 	PROF_EVENT("CDialogHolder::OnFrame");
 	m_b_in_update = true;
 	CUIDialogWnd* wnd = TopInputReceiver();
+	while (wnd && !wnd->IsShown())
+	{
+		SetMainInputReceiver(wnd, true);
+		wnd = TopInputReceiver();
+	}
+
 	if (wnd && wnd->IsEnabled())
 	{
 		wnd->Update();

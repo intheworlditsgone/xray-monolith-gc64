@@ -264,6 +264,9 @@ void CUIGameCustom::SetClGame(game_cl_GameState* gameState)
 
 void CUIGameCustom::UnLoad()
 {
+	HideShownDialogs();
+	CleanInternals();
+
 	xr_delete(MsgConfig);
 	xr_delete(ActorMenu);
 	xr_delete(PdaMenu);

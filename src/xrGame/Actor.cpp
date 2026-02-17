@@ -1140,7 +1140,8 @@ void CActor::UpdateCL()
 	PROF_EVENT("CActor::UpdateCL");
 	if (g_Alive() && Level().CurrentViewEntity() == this)
 	{
-		if (CurrentGameUI() && (!CurrentGameUI()->TopInputReceiver() || (CurrentGameUI()->TopInputReceiver() && !CurrentGameUI()->TopInputReceiver()->StopAnyMove())) && !m_holder)
+		CUIDialogWnd* top_input_receiver = CurrentGameUI() ? CurrentGameUI()->TopInputReceiver() : nullptr;
+		if (CurrentGameUI() && !top_input_receiver && !m_holder)
 		{
 			const bool allowed = psActorFlags.test(AF_MULTI_ITEM_PICKUP);
 

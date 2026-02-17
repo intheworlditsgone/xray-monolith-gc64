@@ -18,6 +18,8 @@
 
 #include "x_ray.h"
 #include "discord\discord.h"
+
+#include <tbb/parallel_for_each.h>
 #include "render.h"
 #include <chrono>
 
@@ -40,6 +42,7 @@ ENGINE_API CLoadScreenRenderer load_screen_renderer;
 
 
 ENGINE_API BOOL g_bRendering = FALSE;
+ENGINE_API int mt_parallel_dispatch = 1; // 1 = use tbb::parallel_for_each for seqParallel, 0 = sequential (legacy)
 
 BOOL g_bLoaded = FALSE;
 ref_light precache_light = 0;
@@ -189,9 +192,25 @@ void mt_Thread(void* ptr)
 		mt_Thread_marker = device.dwFrame;
 		STOP_PROFILE;
 
+		// Phase 1: Run Lua-touching delegates sequentially (Lua VM is not thread-safe)
+		START_PROFILE("Process seqParallelLua");
+		for (u32 pit = 0; pit < device.seqParallelLua.size(); pit++)
+			device.seqParallelLua[pit]();
+		device.seqParallelLua.clear_not_free();
+		STOP_PROFILE;
+
+		// Phase 2: Fan out safe delegates in parallel via TBB, or run sequentially if disabled
 		START_PROFILE("Process seqParallel");
-		for (u32 pit = 0; pit < device.seqParallel.size(); pit++)
-			device.seqParallel[pit]();
+		if (mt_parallel_dispatch && device.seqParallel.size() > 1)
+		{
+			tbb::parallel_for_each(device.seqParallel.begin(), device.seqParallel.end(),
+				[](fastdelegate::FastDelegate0<>& delegate) { delegate(); });
+		}
+		else
+		{
+			for (u32 pit = 0; pit < device.seqParallel.size(); pit++)
+				device.seqParallel[pit]();
+		}
 		device.seqParallel.clear_not_free();
 		STOP_PROFILE;
 
@@ -492,6 +511,9 @@ void CRenderDevice::on_idle()
 	if (dwFrame != mt_Thread_marker)
 	{
 		PROF_EVENT("Execute second thread");
+		for (u32 pit = 0; pit < Device.seqParallelLua.size(); pit++)
+			Device.seqParallelLua[pit]();
+		Device.seqParallelLua.clear_not_free();
 		for (u32 pit = 0; pit < Device.seqParallel.size(); pit++)
 			Device.seqParallel[pit]();
 		Device.seqParallel.clear_not_free();

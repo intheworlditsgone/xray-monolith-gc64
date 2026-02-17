@@ -616,8 +616,7 @@ void CRenderTarget::phase_ssfx_sss()
 	pv->set(0, h, d_Z, d_W, C, p0.x, p1.y); pv++;
 	pv->set(0, 0, d_Z, d_W, C, p0.x, p0.y); pv++;
 	pv->set(w, h, d_Z, d_W, C, p1.x, p1.y); pv++;
-	pv->set(w, 0, d_Z, d_W, C, p1.x, p0.y); pv++;
-	RCache.Vertex.Unlock(4, g_combine->vb_stride);
+	pv->set(w, 0, d_Z, d_W, C, p1.x, p0.y); pv++	RCache.Vertex.Unlock(4, g_combine->vb_stride);
 
 	// Draw COLOR
 	RCache.set_Element(s_ssfx_sss->E[2]);
@@ -782,6 +781,23 @@ void CRenderTarget::phase_ssfx_sss_ext(light_Package& LP)
 		{
 			if (LightSlot[slot])
 			{
+				bool InPackage = false;
+				xr_vector<light*>& source = LP.v_shadowed;
+				for (u32 it = 0; it < source.size(); ++it)
+				{
+					if (source[it] == LightSlot[slot])
+					{
+						InPackage = true;
+						break;
+					}
+				}
+
+				if (!InPackage)
+				{
+					LightSlot[slot] = nullptr;
+					continue;
+				}
+
 				// Check if the light still exist on the sorted Light Package
 				bool Remove = true;
 
@@ -800,6 +816,13 @@ void CRenderTarget::phase_ssfx_sss_ext(light_Package& LP)
 					// The distance calc was skipped, check here instead
 					LightSlot[slot]->distance_lpos = Device.vCameraPosition.distance_to(LightSlot[slot]->position);
 					Remove = false;
+				}
+
+				if (Remove)
+				{
+					LightSlot[slot]->sss_id = -1;
+					LightSlot[slot] = nullptr;
+					continue;
 				}
 
 				float Dist = LightSlot[slot]->distance_lpos;

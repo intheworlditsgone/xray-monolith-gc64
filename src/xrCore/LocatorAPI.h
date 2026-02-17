@@ -81,6 +81,10 @@ private:
 	void ProcessOne(LPCSTR path, const _finddata_t& entry);
 	bool Recurse(LPCSTR path);
 
+	// FS binary cache for fast repeated initialization
+	bool load_fs_cache(LPCSTR cache_path);
+	void save_fs_cache(LPCSTR cache_path);
+
 	files_it file_find_it(LPCSTR n);
 public:
 	enum

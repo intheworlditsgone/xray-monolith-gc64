@@ -646,6 +646,284 @@ bool CLocatorAPI::Recurse(const char* path)
 	return true;
 }
 
+//----------------------------------------------------------------------
+// FS Binary Cache — skip expensive archive scanning on repeat launches
+//----------------------------------------------------------------------
+#define FS_CACHE_MAGIC   0x46534358u  // "XFSC"
+#define FS_CACHE_VERSION 2u
+
+bool CLocatorAPI::load_fs_cache(LPCSTR cache_path)
+{
+	HANDLE hFile = CreateFile(cache_path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+	                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+	if (hFile == INVALID_HANDLE_VALUE)
+		return false;
+
+	DWORD file_size = GetFileSize(hFile, nullptr);
+	if (file_size < 20) // magic(4) + version(4) + fsltx_mtime(8) + num_archives(4)
+	{
+		CloseHandle(hFile);
+		return false;
+	}
+
+	u8* data = (u8*)xr_malloc(file_size);
+	DWORD bytes_read;
+	if (!ReadFile(hFile, data, file_size, &bytes_read, nullptr) || bytes_read != file_size)
+	{
+		xr_free(data);
+		CloseHandle(hFile);
+		return false;
+	}
+	CloseHandle(hFile);
+
+	u8* ptr = data;
+	u8* data_end = data + file_size;
+
+	auto safe_read = [&](void* dst, size_t sz) -> bool {
+		if (ptr + sz > data_end) return false;
+		memcpy(dst, ptr, sz);
+		ptr += sz;
+		return true;
+	};
+
+	// Read & validate header
+	u32 magic = 0, version = 0;
+	u64 cached_fsltx_mtime = 0;
+	if (!safe_read(&magic, 4) || !safe_read(&version, 4) || !safe_read(&cached_fsltx_mtime, 8))
+	{
+		xr_free(data);
+		return false;
+	}
+	if (magic != FS_CACHE_MAGIC || version != FS_CACHE_VERSION)
+	{
+		xr_free(data);
+		return false;
+	}
+
+	// Validate fsgame.ltx modification time
+	{
+		string_path fsltx_path;
+		xr_sprintf(fsltx_path, sizeof(fsltx_path), "%s/" FSLTX, fsRoot.generic_string().c_str());
+		WIN32_FILE_ATTRIBUTE_DATA fad;
+		if (!GetFileAttributesExA(fsltx_path, GetFileExInfoStandard, &fad))
+		{
+			xr_free(data);
+			return false;
+		}
+		u64 fsltx_mtime = ((u64)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+		if (fsltx_mtime != cached_fsltx_mtime)
+		{
+			Msg("FS Cache: fsgame.ltx changed, invalidating cache");
+			xr_free(data);
+			return false;
+		}
+	}
+
+	// Read archive entries
+	u32 num_archives = 0;
+	if (!safe_read(&num_archives, 4))
+	{
+		xr_free(data);
+		return false;
+	}
+
+	struct cached_archive_info
+	{
+		string_path path;
+		u32 vfs_idx;
+		u64 disk_size;
+		u64 disk_mtime;
+	};
+	xr_vector<cached_archive_info> cached_archives;
+	cached_archives.resize(num_archives);
+
+	for (u32 i = 0; i < num_archives; i++)
+	{
+		u32 path_len = 0;
+		if (!safe_read(&path_len, 4) || path_len == 0 || path_len > sizeof(string_path) || ptr + path_len > data_end)
+		{
+			xr_free(data);
+			return false;
+		}
+		memcpy(cached_archives[i].path, ptr, path_len);
+		ptr += path_len;
+		if (!safe_read(&cached_archives[i].vfs_idx, 4) ||
+		    !safe_read(&cached_archives[i].disk_size, 8) ||
+		    !safe_read(&cached_archives[i].disk_mtime, 8))
+		{
+			xr_free(data);
+			return false;
+		}
+	}
+
+	// Validate each archive against on-disk state
+	for (u32 i = 0; i < num_archives; i++)
+	{
+		WIN32_FILE_ATTRIBUTE_DATA fad;
+		if (!GetFileAttributesExA(cached_archives[i].path, GetFileExInfoStandard, &fad))
+		{
+			Msg("FS Cache: archive missing: %s", cached_archives[i].path);
+			xr_free(data);
+			return false;
+		}
+		u64 disk_size = ((u64)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+		u64 disk_mtime = ((u64)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+		if (disk_size != cached_archives[i].disk_size || disk_mtime != cached_archives[i].disk_mtime)
+		{
+			Msg("FS Cache: archive changed: %s", cached_archives[i].path);
+			xr_free(data);
+			return false;
+		}
+	}
+
+	// Archives validated — reconstruct archive entries
+	for (u32 i = 0; i < num_archives; i++)
+	{
+		m_archives.push_back(archive());
+		archive& A = m_archives.back();
+		A.vfs_idx = cached_archives[i].vfs_idx;
+		A.path = cached_archives[i].path;
+		A.header = nullptr;
+	}
+
+	// Read file entries (cache is saved in sorted order, so use hint for O(1) insertion)
+	u32 num_files = 0;
+	if (!safe_read(&num_files, 4))
+	{
+		xr_free(data);
+		return false;
+	}
+
+	auto hint = m_files.end();
+	for (u32 i = 0; i < num_files; i++)
+	{
+		u32 name_len = 0;
+		if (!safe_read(&name_len, 4) || name_len == 0 || ptr + name_len > data_end)
+		{
+			xr_free(data);
+			return false;
+		}
+
+		file desc;
+		desc.name = xr_strdup((LPCSTR)ptr);
+		ptr += name_len;
+
+		if (!safe_read(&desc.vfs, 4) || !safe_read(&desc.crc, 4) || !safe_read(&desc.ptr, 4) ||
+		    !safe_read(&desc.size_real, 4) || !safe_read(&desc.size_compressed, 4) || !safe_read(&desc.modif, 4))
+		{
+			char* tmp = const_cast<char*>(desc.name);
+			xr_free(tmp);
+			xr_free(data);
+			return false;
+		}
+
+		hint = m_files.insert(hint, desc);
+	}
+
+	xr_free(data);
+
+	// Open archive file handles and re-read headers (needed by level loading)
+	for (auto& A : m_archives)
+	{
+		A.open();
+		IReader* hdr = open_chunk(A.hSrcFile, CFS_HeaderChunkID);
+		if (hdr)
+		{
+			A.header = xr_new<CInifile>(hdr, "archive_header");
+			hdr->close();
+		}
+	}
+
+	return true;
+}
+
+void CLocatorAPI::save_fs_cache(LPCSTR cache_path)
+{
+	// Compute exact buffer size
+	size_t total_size = 4 + 4 + 8 + 4; // magic + version + fsltx_mtime + num_archives
+	for (const archive& A : m_archives)
+		total_size += 4 + (xr_strlen(*A.path) + 1) + 4 + 8 + 8;
+	total_size += 4; // num_files
+	for (const file& F : m_files)
+		total_size += 4 + (xr_strlen(F.name) + 1) + 6 * 4;
+
+	u8* buffer = (u8*)xr_malloc(total_size);
+	u8* ptr = buffer;
+
+	auto write_raw = [&](const void* src, size_t sz) {
+		memcpy(ptr, src, sz);
+		ptr += sz;
+	};
+	auto write_u32 = [&](u32 val) { write_raw(&val, 4); };
+	auto write_u64 = [&](u64 val) { write_raw(&val, 8); };
+
+	write_u32(FS_CACHE_MAGIC);
+	write_u32(FS_CACHE_VERSION);
+
+	// Store fsgame.ltx modification time
+	{
+		string_path fsltx_path;
+		xr_sprintf(fsltx_path, sizeof(fsltx_path), "%s/" FSLTX, fsRoot.generic_string().c_str());
+		WIN32_FILE_ATTRIBUTE_DATA fad;
+		u64 fsltx_mtime = 0;
+		if (GetFileAttributesExA(fsltx_path, GetFileExInfoStandard, &fad))
+			fsltx_mtime = ((u64)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+		write_u64(fsltx_mtime);
+	}
+
+	// Write archive entries
+	write_u32((u32)m_archives.size());
+	for (const archive& A : m_archives)
+	{
+		u32 path_len = (u32)xr_strlen(*A.path) + 1;
+		write_u32(path_len);
+		write_raw(*A.path, path_len);
+		write_u32(A.vfs_idx);
+
+		WIN32_FILE_ATTRIBUTE_DATA fad;
+		u64 disk_size = 0, disk_mtime = 0;
+		if (GetFileAttributesExA(*A.path, GetFileExInfoStandard, &fad))
+		{
+			disk_size = ((u64)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+			disk_mtime = ((u64)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+		}
+		write_u64(disk_size);
+		write_u64(disk_mtime);
+	}
+
+	// Write file entries (iterated in sorted order from std::set)
+	write_u32((u32)m_files.size());
+	for (const file& F : m_files)
+	{
+		u32 name_len = (u32)xr_strlen(F.name) + 1;
+		write_u32(name_len);
+		write_raw(F.name, name_len);
+		write_u32(F.vfs);
+		write_u32(F.crc);
+		write_u32(F.ptr);
+		write_u32(F.size_real);
+		write_u32(F.size_compressed);
+		write_u32(F.modif);
+	}
+
+	DWORD written_size = (DWORD)(ptr - buffer);
+	HANDLE hFile = CreateFile(cache_path, GENERIC_WRITE, 0, nullptr,
+	                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (hFile != INVALID_HANDLE_VALUE)
+	{
+		DWORD bytes_written;
+		WriteFile(hFile, buffer, written_size, &bytes_written, nullptr);
+		CloseHandle(hFile);
+		Msg("FS Cache: saved %d files, %d archives (%d KB)", m_files.size(), m_archives.size(), written_size / 1024);
+	}
+	else
+	{
+		Msg("FS Cache: failed to write %s", cache_path);
+	}
+
+	xr_free(buffer);
+}
+
 bool file_handle_internal(LPCSTR file_name, u32& size, int& file_handle);
 void* FileDownload(LPCSTR file_name, const int& file_handle, u32& file_size);
 
@@ -775,6 +1053,23 @@ void CLocatorAPI::_initialize(u32 flags, LPCSTR target_folder, LPCSTR fs_name)
 	else
 	{
 		IReader* pFSltx = setup_fs_ltx(fs_name);
+
+		// FS Binary Cache: try to load from cache to skip expensive directory/archive scanning
+		string_path cache_path;
+		bool cache_loaded = false;
+		bool cache_enabled = !strstr(Core.Params, "-nofscache");
+		if (cache_enabled)
+		{
+			xr_sprintf(cache_path, sizeof(cache_path), "%s/fs_cache.bin", fsRoot.generic_string().c_str());
+			CTimer cache_timer;
+			cache_timer.Start();
+			cache_loaded = load_fs_cache(cache_path);
+			if (cache_loaded)
+				Msg("FS Cache: loaded in %.3f sec", cache_timer.GetElapsed_sec());
+			else
+				Msg("FS Cache: miss — performing full scan");
+		}
+
 		// append all pathes    
 		string_path id, root, add, def, capt;
 		const char *lp_add, *lp_def, *lp_capt;
@@ -828,8 +1123,14 @@ void CLocatorAPI::_initialize(u32 flags, LPCSTR target_folder, LPCSTR fs_name)
 			}
 
 			FS_Path* P = new FS_Path((p_it != pathes.end()) ? p_it->second->m_Path : root, lp_add, lp_def, lp_capt, fl);
-			bNoRecurse = !(fl & FS_Path::flRecurse);
-			Recurse(P->m_Path);
+
+			// Only scan directories if cache was not loaded
+			if (!cache_loaded)
+			{
+				bNoRecurse = !(fl & FS_Path::flRecurse);
+				Recurse(P->m_Path);
+			}
+
 			auto I = pathes.insert(std::make_pair(xr_strdup(id), P));
 #ifndef DEBUG
 			m_Flags.set(flCacheFiles, FALSE);
@@ -839,6 +1140,10 @@ void CLocatorAPI::_initialize(u32 flags, LPCSTR target_folder, LPCSTR fs_name)
 		}
 		r_close(pFSltx);
 		R_ASSERT(path_exist("$app_data_root$"));
+
+		// Save cache after a full scan so next launch is fast
+		if (!cache_loaded && cache_enabled)
+			save_fs_cache(cache_path);
 	};
 
 

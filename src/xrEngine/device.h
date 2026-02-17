@@ -37,6 +37,8 @@
 
 class engine_impl;
 
+extern ENGINE_API int mt_parallel_dispatch;
+
 #pragma pack(push,4)
 
 class IRenderDevice
@@ -248,6 +250,7 @@ public:
 	CRegistrator<pureFrame> seqFrameMT;
 	CRegistrator<pureDeviceReset> seqDeviceReset;
 	xr_vector<fastdelegate::FastDelegate0<>> seqParallel;
+	xr_vector<fastdelegate::FastDelegate0<>> seqParallelLua; // Lua-touching delegates (must run sequentially, never in parallel)
 
 	// Dependent classes
 	//CResourceManager* Resources;
@@ -463,7 +466,18 @@ public:
 			delegate
 		);
 		if (I != seqParallel.end())
+		{
 			seqParallel.erase(I);
+			return;
+		}
+		// Also check the Lua-sequential queue
+		xr_vector<fastdelegate::FastDelegate0<>>::iterator J = std::find(
+			seqParallelLua.begin(),
+			seqParallelLua.end(),
+			delegate
+		);
+		if (J != seqParallelLua.end())
+			seqParallelLua.erase(J);
 	}
 
 	//AVO: elapsed famed counter (by alpet)
