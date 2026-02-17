@@ -18,8 +18,6 @@
 
 #include "x_ray.h"
 #include "discord\discord.h"
-
-#include <tbb/parallel_for_each.h>
 #include "render.h"
 #include <chrono>
 
@@ -37,12 +35,13 @@
 
 #pragma comment( lib, "d3dx9.lib" )
 
+#include <tbb/task_group.h>
+
 ENGINE_API CRenderDevice Device;
 ENGINE_API CLoadScreenRenderer load_screen_renderer;
 
 
 ENGINE_API BOOL g_bRendering = FALSE;
-ENGINE_API int mt_parallel_dispatch = 1; // 1 = use tbb::parallel_for_each for seqParallel, 0 = sequential (legacy)
 
 BOOL g_bLoaded = FALSE;
 ref_light precache_light = 0;
@@ -169,64 +168,51 @@ void CRenderDevice::End(void)
 
 volatile u32 mt_Thread_marker = 0x12345678;
 
-void mt_Thread(void* ptr)
+// Dispatch all accumulated seqParallel delegates + seqFrameMT registrants as TBB tasks.
+// Called once per frame after camera matrices are ready, before rendering.
+void CRenderDevice::run_parallel_jobs()
 {
-	auto& device = *static_cast<CRenderDevice*>(ptr);
-	while (true)
+	if (m_parallel_jobs_running.load(std::memory_order_relaxed))
+		return; // already dispatched this frame
+
+	m_parallel_jobs_running.store(true, std::memory_order_release);
+	mt_Thread_marker = dwFrame;
+
+	// Snapshot the delegates and clear the vector so game logic
+	// can push new ones for next frame without races.
+	xr_vector<fastdelegate::FastDelegate0<>> jobs;
+	jobs.swap(seqParallel);
+
+	// Submit each delegate as a TBB task
+	for (auto& job : jobs)
 	{
-		PROF_EVENT();
-
-		START_PROFILE("Wait for device");
-		// waiting for Device permission to execute
-		device.mt_csEnter.Enter();
-
-		if (device.mt_bMustExit)
-		{
-			PROF_EVENT("Must exit");
-
-			device.mt_bMustExit = FALSE; // Important!!!
-			device.mt_csEnter.Leave(); // Important!!!
-			return;
-		}
-		// we has granted permission to execute
-		mt_Thread_marker = device.dwFrame;
-		STOP_PROFILE;
-
-		// Phase 1: Run Lua-touching delegates sequentially (Lua VM is not thread-safe)
-		START_PROFILE("Process seqParallelLua");
-		for (u32 pit = 0; pit < device.seqParallelLua.size(); pit++)
-			device.seqParallelLua[pit]();
-		device.seqParallelLua.clear_not_free();
-		STOP_PROFILE;
-
-		// Phase 2: Fan out safe delegates in parallel via TBB, or run sequentially if disabled
-		START_PROFILE("Process seqParallel");
-		if (mt_parallel_dispatch && device.seqParallel.size() > 1)
-		{
-			tbb::parallel_for_each(device.seqParallel.begin(), device.seqParallel.end(),
-				[](fastdelegate::FastDelegate0<>& delegate) { delegate(); });
-		}
-		else
-		{
-			for (u32 pit = 0; pit < device.seqParallel.size(); pit++)
-				device.seqParallel[pit]();
-		}
-		device.seqParallel.clear_not_free();
-		STOP_PROFILE;
-
-		START_PROFILE("Process seqFrameMT");
-		device.seqFrameMT.Process(rp_Frame);
-		STOP_PROFILE;
-
-		START_PROFILE("Synchronization");
-		// now we give control to device - signals that we are ended our work
-		device.mt_csEnter.Leave();
-		// waits for device signal to continue - to start again
-		device.mt_csLeave.Enter();
-		// returns sync signal to device
-		device.mt_csLeave.Leave();
-		STOP_PROFILE;
+		m_task_group.run([j = std::move(job)]() {
+			j();
+		});
 	}
+
+	// Submit seqFrameMT registrants (physics, sound, network)
+	// These are persistent per-frame callbacks, not one-shot delegates.
+	for (u32 i = 0; i < seqFrameMT.R.size(); i++)
+	{
+		if (seqFrameMT.R[i].Prio != REG_PRIORITY_INVALID)
+		{
+			auto* obj = static_cast<pureFrame*>(seqFrameMT.R[i].Object);
+			m_task_group.run([obj]() {
+				obj->OnFrame();
+			});
+		}
+	}
+}
+
+// Block until all parallel tasks complete. Safe to call multiple times per frame.
+void CRenderDevice::sync_parallel_jobs()
+{
+	if (!m_parallel_jobs_running.load(std::memory_order_acquire))
+		return; // nothing was dispatched
+
+	m_task_group.wait();
+	m_parallel_jobs_running.store(false, std::memory_order_release);
 }
 
 #include "igame_level.h"
@@ -383,6 +369,10 @@ void CRenderDevice::on_idle()
 
 	if (g_loading_events.size())
 	{
+		// Ensure any in-flight parallel tasks from the previous frame
+		// are finished before loading events tear down game objects.
+		sync_parallel_jobs();
+
 		PROF_EVENT("Pop loading event");
 		if (g_loading_events.front()())
 			g_loading_events.pop_front();
@@ -437,12 +427,11 @@ void CRenderDevice::on_idle()
 	mProject_saved = mProject;
 	STOP_PROFILE;
 
-	// *** Resume threads
-	// Capture end point - thread must run only ONE cycle
-	// Release start point - allow thread to run
-	START_PROFILE("Resume threads");
-	mt_csLeave.Enter();
-	mt_csEnter.Leave();
+	// *** Dispatch parallel jobs
+	// Camera matrices are now ready — submit seqParallel + seqFrameMT as TBB tasks.
+	// These run concurrently with eco-render sleep and rendering below.
+	START_PROFILE("Dispatch parallel jobs");
+	run_parallel_jobs();
 	STOP_PROFILE;
 
 #ifdef ECO_RENDER // ECO_RENDER START
@@ -499,26 +488,12 @@ void CRenderDevice::on_idle()
 	Statistic->RenderTOTAL_Real.FrameEnd();
 	Statistic->RenderTOTAL.accum = Statistic->RenderTOTAL_Real.accum;
 #endif // #ifndef DEDICATED_SERVER
-	// *** Suspend threads
-	// Capture startup point
-	// Release end point - allow thread to wait for startup point
-	START_PROFILE("Suspend threads");
-	mt_csEnter.Enter();
-	mt_csLeave.Leave();
+	// *** Sync parallel jobs
+	// Ensure all parallel work (physics, AI vision, HOM, details, etc.) is complete
+	// before we proceed to the next frame.
+	START_PROFILE("Sync parallel jobs");
+	sync_parallel_jobs();
 	STOP_PROFILE;
-
-	// Ensure, that second thread gets chance to execute anyway
-	if (dwFrame != mt_Thread_marker)
-	{
-		PROF_EVENT("Execute second thread");
-		for (u32 pit = 0; pit < Device.seqParallelLua.size(); pit++)
-			Device.seqParallelLua[pit]();
-		Device.seqParallelLua.clear_not_free();
-		for (u32 pit = 0; pit < Device.seqParallel.size(); pit++)
-			Device.seqParallel[pit]();
-		Device.seqParallel.clear_not_free();
-		seqFrameMT.Process(rp_Frame);
-	}
 
 #ifdef DEDICATED_SERVER
     u32 FrameEndTime = TimerGlobal.GetElapsed_ms();
@@ -588,24 +563,16 @@ void CRenderDevice::Run()
 		Timer_MM_Delta = time_system - time_local;
 	}
 	// Start all threads
-	// InitializeCriticalSection (&mt_csEnter);
-	// InitializeCriticalSection (&mt_csLeave);
-	mt_csEnter.Enter();
 	mt_bMustExit = FALSE;
 	thread_spawn(mt_FreezeThread, "Freeze detecting thread", 0, 0);
-	thread_spawn(mt_Thread, "X-RAY Secondary thread", 0, this);
 	// Message cycle
 	seqAppStart.Process(rp_AppStart);
 
 	m_pRender->ClearTarget();
 	message_loop();
 	seqAppEnd.Process(rp_AppEnd);
-	// Stop Balance-Thread
-	mt_bMustExit = TRUE;
-	mt_csEnter.Leave();
-	while (mt_bMustExit) Sleep(0);
-	// DeleteCriticalSection (&mt_csEnter);
-	// DeleteCriticalSection (&mt_csLeave);
+	// Ensure all parallel jobs are finished before shutdown
+	sync_parallel_jobs();
 }
 
 u32 app_inactive_time = 0;

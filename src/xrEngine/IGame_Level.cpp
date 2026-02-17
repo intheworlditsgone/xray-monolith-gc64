@@ -42,9 +42,10 @@ IGame_Level::~IGame_Level()
 	// Render-level unload
 	Render->level_Unload();
 	xr_delete(m_pCameras);
+	// Ensure all parallel tasks are done before tearing down level objects
+	Device.sync_parallel_jobs();
 	// Unregister
 	Device.seqParallel.clear_not_free();
-	Device.seqParallelLua.clear_not_free();
 	Device.seqRender.Remove(this);
 	Device.seqFrame.Remove(this);
 	CCameraManager::ResetPP();
